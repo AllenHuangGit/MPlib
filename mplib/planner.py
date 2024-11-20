@@ -25,7 +25,7 @@ class Planner:
     def __init__(
         self,
         urdf: Union[str, Path],
-        move_group: str,
+        move_group: Union[str, list[str]],
         *,
         srdf: Union[str, Path, None] = None,
         new_package_keyword: str = "",
@@ -93,9 +93,17 @@ class Planner:
         for i, link in enumerate(self.user_link_names):
             self.link_name_2_idx[link] = i
 
-        assert (
-            move_group in self.user_link_names
-        ), f"end-effector not found as one of the links in {self.user_link_names}"
+        # Check if move_group is a list or a single string
+        if isinstance(move_group, list):
+            for group in move_group:
+                assert (
+                    group in self.user_link_names
+                ), f"end-effector {group} not found as one of the links in {self.user_link_names}"
+        else:
+            assert (
+                move_group in self.user_link_names
+            ), f"end-effector {move_group} not found as one of the links in {self.user_link_names}"
+
         self.move_group = move_group
         self.robot.set_move_group(self.move_group)
         self.move_group_joint_indices = self.robot.get_move_group_joint_indices()
@@ -108,7 +116,11 @@ class Planner:
             joint_acc_limits = np.ones(len(self.move_group_joint_indices))
         self.joint_vel_limits = joint_vel_limits
         self.joint_acc_limits = joint_acc_limits
-        self.move_group_link_id = self.link_name_2_idx[self.move_group]
+        
+        # TODO: change move_group_link_id to list may cause bugs in attach and plan_screw
+        self.move_group_link_id = [
+            self.link_name_2_idx[group] for group in move_group
+        ] if isinstance(move_group, list) else self.link_name_2_idx[move_group]
 
         assert (
             len(self.joint_vel_limits)
@@ -428,7 +440,8 @@ class Planner:
         :param link_id: if not provided, the end effector will be the target.
         """
         if link_id == -1:
-            link_id = self.move_group_link_id
+            # TODO: This change may cause bugs in attach.
+            link_id = self.move_group_link_id[0] if isinstance(self.move_group_link_id, list) else self.move_group_link_id
         self.planning_world.attach_object(
             name,
             collision_geometry,
@@ -450,7 +463,8 @@ class Planner:
         :param link_id: if not provided, the end effector will be the target.
         """
         if link_id == -1:
-            link_id = self.move_group_link_id
+            # TODO: This change may cause bugs in attach.
+            link_id = self.move_group_link_id[0] if isinstance(self.move_group_link_id, list) else self.move_group_link_id
         self.planning_world.attach_sphere(
             radius,
             self.robot.get_name() if art_name is None else art_name,
@@ -478,7 +492,8 @@ class Planner:
         :param link_id: if not provided, the end effector will be the target.
         """
         if link_id == -1:
-            link_id = self.move_group_link_id
+            # TODO: This change may cause bugs in attach.
+            link_id = self.move_group_link_id[0] if isinstance(self.move_group_link_id, list) else self.move_group_link_id
         self.planning_world.attach_box(
             size,  # type: ignore
             self.robot.get_name() if art_name is None else art_name,
@@ -499,7 +514,8 @@ class Planner:
         :param link_id: if not provided, the end effector will be the target.
         """
         if link_id == -1:
-            link_id = self.move_group_link_id
+            # TODO: This change may cause bugs in attach.
+            link_id = self.move_group_link_id[0] if isinstance(self.move_group_link_id, list) else self.move_group_link_id
         self.planning_world.attach_mesh(
             mesh_path,
             self.robot.get_name() if art_name is None else art_name,
@@ -772,7 +788,9 @@ class Planner:
             return np.concatenate([v, omega]), theta
 
         self.pinocchio_model.compute_forward_kinematics(current_qpos)
-        ee_index = self.link_name_2_idx[self.move_group]
+
+        # TODO: This change may cause bugs
+        ee_index = self.link_name_2_idx[self.move_group[0]] if isinstance(self.move_group, list) else self.link_name_2_idx[self.move_group]
         # relative_pose = T_base_goal * T_base_link.inv()
         relative_pose = goal_pose * self.pinocchio_model.get_link_pose(ee_index).inv()
         omega, theta = pose2exp_coordinate(relative_pose)
