@@ -8,6 +8,7 @@ import numpy as np
 import toppra as ta
 import toppra.algorithm as algo
 import toppra.constraint as constraint
+from scipy.spatial.transform import Rotation as R
 
 from .collision_detection import WorldCollisionResult
 from .collision_detection.fcl import CollisionGeometry, FCLObject
@@ -142,7 +143,8 @@ class Planner:
         self.planning_world = PlanningWorld([self.robot], objects)
         self.acm = self.planning_world.get_allowed_collision_matrix()
 
-        self.planner = OMPLPlanner(world=self.planning_world)
+        # TODO: comment out for fetch robot
+        # self.planner = OMPLPlanner(world=self.planning_world)
 
     def wrap_joint_limit(self, qpos: np.ndarray) -> bool:
         """
@@ -258,6 +260,8 @@ class Planner:
         threshold: float = 1e-3,
         return_closest: bool = False,
         verbose: bool = False,
+        orientation_free: bool = False,
+        offset_distance: float = 0.0,
     ) -> tuple[str, Union[list[np.ndarray], np.ndarray, None]]:
         """
         Compute inverse kinematics
@@ -271,6 +275,8 @@ class Planner:
         :param return_closest: whether to return the qpos that is closest to start_qpos,
             considering equivalent joint values.
         :param verbose: whether to print collision info if any collision exists.
+        :param orientation_free: whether to ignore orientation in IK.
+        :param offset_distance: distance to offset the goal position along the forward
         :return: (status, q_goals)
 
             status: IK status, "Success" if succeeded.
@@ -283,6 +289,9 @@ class Planner:
         if mask is None:
             mask = []
 
+        mask_indices = np.where(mask)[0]
+
+        assert isinstance(self.move_group, str), "Only support single move_group now"
         move_link_idx = self.link_name_2_idx[self.move_group]
         move_joint_idx = self.move_group_joint_indices
         self.robot.set_qpos(start_qpos, True)
@@ -290,7 +299,28 @@ class Planner:
         min_dist = 1e9
         q_goals = []
         qpos = start_qpos
+        initial_goal_pose_p = goal_pose.p.copy()
+
         for _ in range(n_init_qpos):
+            if orientation_free:
+                # Assign random orientation to goal_pose
+                random_quaternion = np.random.randn(4)
+                random_quaternion /= np.linalg.norm(random_quaternion)
+                goal_pose.set_q(random_quaternion)
+
+            if offset_distance != 0.0:
+                # Convert the quaternion to a rotation object
+                rotation = R.from_quat(goal_pose.q)
+
+                # Get the forward direction vector (e.g., x-axis in local frame)
+                direction_vector = rotation.apply([1, 0, 0])  # Adjust the axis if needed
+
+                # Calculate the offset vector
+                offset_vector = direction_vector * offset_distance
+
+                # Update the goal position
+                goal_pose.set_p(initial_goal_pose_p + offset_vector)
+
             ik_qpos, ik_success, _ = self.pinocchio_model.compute_IK_CLIK(
                 move_link_idx,
                 goal_pose,
@@ -330,7 +360,7 @@ class Planner:
                         q_goals.append(ik_qpos)
 
             qpos = self.pinocchio_model.get_random_configuration()
-            qpos[mask] = start_qpos[mask]  # use start_qpos for disabled joints
+            qpos[mask_indices] = start_qpos[mask_indices]
 
         if len(q_goals) != 0:
             status = "Success"
@@ -359,6 +389,122 @@ class Planner:
 
             q_goals = q_goals[np.linalg.norm(q_goals - start_qpos, axis=1).argmin()]
         return status, q_goals
+    
+    def IK_dual_arm(
+    self,
+    goal_poses: list[Pose],
+    start_qpos: np.ndarray,
+    mask: Optional[Union[Sequence[bool], np.ndarray]] = None,
+    *,
+    n_init_qpos: int = 30,
+    threshold: float = 1e-3,
+    return_closest: bool = False,
+    verbose: bool = False,
+    ) -> tuple[str, Optional[np.ndarray]]:
+        """
+        Compute inverse kinematics for dual-arm robots
+
+        :param goal_poses: goal poses for each end-effector
+        :param start_qpos: initial configuration, (ndof,) np.floating np.ndarray.
+        :param mask: qpos mask to disable IK sampling, (ndof,) bool np.ndarray, which should normally be None, using default mask for dual-arm.
+        :param n_init_qpos: number of random initial configurations to sample.
+        :param threshold: distance threshold for marking sampled IK as success.
+            distance is position error norm + quaternion error norm.
+        :param return_closest: whether to return the qpos that is closest to start_qpos,
+            considering equivalent joint values.
+        :param verbose: whether to print collision info if any collision exists.
+        :return: (status, q_goals)
+
+            status: IK status, "Success" if succeeded.
+
+            q_goals: list of sampled IK qpos, (ndof,) np.floating np.ndarray.
+                IK is successful if q_goals is not None.
+                If return_closest, q_goals is np.ndarray if successful
+                and None if not successful.
+        """
+        
+        if mask is None:
+            # Default mask for dual-arm, disable the joints of the other arm and gripper
+            mask = [[0, 1] * 7 + [1, 1, 1, 1], [1, 0] * 7 + [1, 1, 1, 1]]
+
+            # Define the indices of the joints that are used for IK
+            IK_indices = [[0, 2, 4, 6, 8, 10, 12], [1, 3, 5, 7, 9, 11, 13]]
+
+        move_link_indices = [self.link_name_2_idx[group] for group in self.move_group]
+        move_joint_indices = self.move_group_joint_indices
+
+        self.robot.set_qpos(start_qpos, True)
+        min_dist = 1e9
+        q_goals = []
+
+        # Initialize lists to hold IK solutions for each arm
+        ik_solutions_per_arm = [[], []]
+
+        # Loop over arms to compute IK solutions separately
+        for arm_idx, move_link_idx in enumerate(move_link_indices):
+            qpos = start_qpos.copy()
+            arm_solutions = []
+            for _ in range(n_init_qpos):
+                # Generate a random initial configuration for this arm
+                qpos_random = self.pinocchio_model.get_random_configuration()
+                qpos[IK_indices[arm_idx]] = qpos_random[IK_indices[arm_idx]]
+
+                # Compute IK for this arm
+                ik_qpos, success, _ = self.pinocchio_model.compute_IK_CLIK(
+                    move_link_idx,
+                    goal_poses[arm_idx],
+                    qpos,
+                    mask[arm_idx],
+                )
+
+                if success and self.wrap_joint_limit(ik_qpos):
+                    # Store the arm's IK solution
+                    arm_solutions.append(ik_qpos.copy())
+
+            ik_solutions_per_arm[arm_idx] = arm_solutions
+
+        # Check if IK solutions were found for both arms
+        if not ik_solutions_per_arm[0] or not ik_solutions_per_arm[1]:
+            status = "IK Failed! Cannot find valid solutions for both arms."
+            return status, None
+        
+        # Now combine the solutions and check for collisions
+        collision_free_solutions = []
+        for ik_qpos_arm1 in ik_solutions_per_arm[0]:
+            for ik_qpos_arm2 in ik_solutions_per_arm[1]:
+                # Combine the configurations
+                ik_qpos = start_qpos.copy()
+                ik_qpos[self.arm_joint_indices[0]] = ik_qpos_arm1[self.arm_joint_indices[0]]
+                ik_qpos[self.arm_joint_indices[1]] = ik_qpos_arm2[self.arm_joint_indices[1]]
+
+                # Check for collisions
+                self.planning_world.set_qpos_all(ik_qpos[move_joint_indices])
+                collisions = self.planning_world.check_collision()
+                if not collisions:
+                    # Compute the total distance to goal poses
+                    self.pinocchio_model.compute_forward_kinematics(ik_qpos)
+                    dist = 0
+                    for idx, move_link_idx in enumerate(move_link_indices):
+                        new_pose = self.pinocchio_model.get_link_pose(move_link_idx)
+                        dist += goal_poses[idx].distance(new_pose)
+                    if dist < threshold:
+                        collision_free_solutions.append((ik_qpos.copy(), dist))
+                        
+        if collision_free_solutions:
+            status = "Success"
+            if return_closest:
+                # Find solution closest to start_qpos
+                distances = [np.linalg.norm(sol[0] - start_qpos) for sol in collision_free_solutions]
+                best_idx = np.argmin(distances)
+                best_solution = collision_free_solutions[best_idx][0]
+                return status, best_solution
+            else:
+                # Return all collision-free solutions
+                solutions = [sol[0] for sol in collision_free_solutions]
+                return status, solutions
+        else:
+            status = "IK Failed! No collision-free solutions found."
+            return status, None
 
     def TOPP(self, path, step=0.1, verbose=False, duration=None):
         """
