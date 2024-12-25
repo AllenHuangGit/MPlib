@@ -223,7 +223,7 @@ class Planner:
         # reset qpos
         articulation.set_qpos(old_qpos, True)
         return collisions
-
+    
     def check_for_self_collision(
         self,
         state: Optional[np.ndarray] = None,
@@ -474,8 +474,8 @@ class Planner:
             for ik_qpos_arm2 in ik_solutions_per_arm[1]:
                 # Combine the configurations
                 ik_qpos = start_qpos.copy()
-                ik_qpos[self.arm_joint_indices[0]] = ik_qpos_arm1[self.arm_joint_indices[0]]
-                ik_qpos[self.arm_joint_indices[1]] = ik_qpos_arm2[self.arm_joint_indices[1]]
+                ik_qpos[IK_indices[0]] = ik_qpos_arm1[IK_indices[0]]
+                ik_qpos[IK_indices[1]] = ik_qpos_arm2[IK_indices[1]]
 
                 # Check for collisions
                 self.planning_world.set_qpos_all(ik_qpos[move_joint_indices])
